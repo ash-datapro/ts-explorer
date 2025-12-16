@@ -1,0 +1,410 @@
+# ============================================================
+# train_amzn_model.R
+# Direct multi-horizon return forecasting w/ rolling-origin CV
+# Saves: reports/backtest_metrics.csv and model.rds
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(DBI)
+  library(RPostgres)
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(slider)
+  library(stringr)
+  
+  library(rsample)
+  library(recipes)
+  library(parsnip)
+  library(workflows)
+  library(tune)
+  library(dials)
+  library(yardstick)
+  
+  library(readr)
+  library(purrr)
+  library(ggplot2)
+  library(glue)
+  
+})
+
+# ---------------------------
+# 0) Config
+# ---------------------------
+set.seed(42)
+
+setwd("~/Desktop/Project/ts-ex/backend/")
+
+horizons = c(1L, 5L, 20L)          # 1d, 1w, 1m trading-ish
+initial_n = 900L                   # ~3.5 years of trading days (tweak)
+skip_n = 20L                       # step folds about monthly
+grid_size = 25L                    # tuning budget per horizon
+out_dir = "reports"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Database settings (prefer env vars; safe for repos/CI)
+db_user = Sys.getenv("DB_USER", unset = "amzn_user")
+db_password = Sys.getenv("DB_PASSWORD", unset = "timeseries1")
+db_host = Sys.getenv("DB_HOST", unset = "localhost")
+db_port = as.integer(Sys.getenv("DB_PORT", unset = "5432"))
+db_name = Sys.getenv("DB_NAME", unset = "amzn_ts")
+
+db_table = "finance.amzn_daily"    # expects columns: date (DATE), amzn (NUMERIC)
+
+# ---------------------------
+# 1) DB connect
+# ---------------------------
+con = NULL
+tryCatch({
+  con = dbConnect(
+    RPostgres::Postgres(),
+    user = db_user,
+    password = db_password,
+    host = db_host,
+    port = db_port,
+    dbname = db_name
+  )
+  on.exit({ if (!is.null(con) && dbIsValid(con)) dbDisconnect(con) }, add = TRUE)
+}, error = function(e) {
+  stop("Error creating DB connection: ", conditionMessage(e))
+})
+
+# ---------------------------
+# 2) Load data
+# ---------------------------
+load_prices = function(con, table_name) {
+  q = sprintf("SELECT date, amzn FROM %s ORDER BY date;", table_name)
+  df = dbGetQuery(con, q)
+  
+  df = df |>
+    mutate(
+      date = as.Date(date),
+      amzn = as.numeric(amzn)
+    ) |>
+    filter(!is.na(date), !is.na(amzn)) |>
+    arrange(date)
+  
+  if (any(duplicated(df$date))) {
+    df = df |>
+      group_by(date) |>
+      summarise(amzn = last(amzn), .groups = "drop") |>
+      arrange(date)
+  }
+  
+  df
+}
+
+prices = load_prices(con, db_table)
+
+# ---------------------------
+# 3) Feature engineering (leakage-safe: lags/rolls use only past)
+# ---------------------------
+engineer_features = function(df) {
+  df = df |>
+    arrange(date) |>
+    mutate(
+      log_price = log(amzn),
+      ret_1 = log_price - lag(log_price)   # daily log return
+    )
+  
+  # rolling helpers on returns (all left-closed by construction via lag/slide)
+  df = df |>
+    mutate(
+      # lagged returns
+      lag_ret_1  = lag(ret_1, 1),
+      lag_ret_2  = lag(ret_1, 2),
+      lag_ret_3  = lag(ret_1, 3),
+      lag_ret_5  = lag(ret_1, 5),
+      lag_ret_10 = lag(ret_1, 10),
+      lag_ret_20 = lag(ret_1, 20),
+      
+      # rolling vol (sd) and mean, using only past values
+      roll_mean_5  = slider::slide_dbl(ret_1, mean, .before = 5,  .complete = TRUE, na.rm = TRUE),
+      roll_mean_20 = slider::slide_dbl(ret_1, mean, .before = 20, .complete = TRUE, na.rm = TRUE),
+      
+      roll_sd_5  = slider::slide_dbl(ret_1, sd, .before = 5,  .complete = TRUE, na.rm = TRUE),
+      roll_sd_20 = slider::slide_dbl(ret_1, sd, .before = 20, .complete = TRUE, na.rm = TRUE),
+      roll_sd_60 = slider::slide_dbl(ret_1, sd, .before = 60, .complete = TRUE, na.rm = TRUE),
+      
+      # momentum proxies: cumulative return over windows (sum of log returns)
+      mom_5  = slider::slide_dbl(ret_1, sum, .before = 5,  .complete = TRUE, na.rm = TRUE),
+      mom_20 = slider::slide_dbl(ret_1, sum, .before = 20, .complete = TRUE, na.rm = TRUE),
+      mom_60 = slider::slide_dbl(ret_1, sum, .before = 60, .complete = TRUE, na.rm = TRUE),
+      
+      # calendar (often weak for stocks but cheap + safe)
+      dow = wday(date, label = TRUE, week_start = 1),
+      month = month(date, label = TRUE)
+    )
+  
+  df
+}
+
+feat = engineer_features(prices)
+
+# ---------------------------
+# 4) Build supervised set for a given horizon h
+# Target: h-day ahead log return (direct model)
+# ---------------------------
+make_supervised = function(df, h) {
+  out = df |>
+    mutate(target = lead(ret_1, h)) |>
+    select(
+      date, target,
+      starts_with("lag_ret_"),
+      starts_with("roll_mean_"),
+      starts_with("roll_sd_"),
+      starts_with("mom_"),
+      dow, month
+    ) |>
+    filter(!is.na(target))
+  
+  out
+}
+
+# ---------------------------
+# 5) Resampling (rolling-origin CV)
+# ---------------------------
+make_rolling_folds = function(df, initial, assess, skip) {
+  # assess = horizon length, so each fold has exactly h rows in assessment
+  rsample::rolling_origin(
+    df,
+    initial = initial,
+    assess = assess,
+    cumulative = TRUE,
+    skip = skip
+  )
+}
+
+# ---------------------------
+# 6) Recipe + model spec
+# ---------------------------
+build_recipe = function(df_train) {
+  recipe(target ~ ., data = df_train) |>
+    update_role(date, new_role = "id") |>
+    step_impute_median(all_numeric_predictors()) |>
+    step_impute_mode(all_nominal_predictors()) |>
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+    step_zv(all_predictors()) |>
+    step_normalize(all_numeric_predictors())
+}
+
+xgb_spec = function() {
+  boost_tree(
+    trees = tune(),
+    learn_rate = tune(),
+    tree_depth = tune(),
+    min_n = tune(),
+    sample_size = tune()
+  ) |>
+    set_engine("xgboost") |>
+    set_mode("regression")
+}
+
+make_grid = function(df_train) {
+  grid_random(
+    finalize(trees(), df_train),
+    learn_rate(range = c(0.01, 0.2)),
+    tree_depth(range = c(2L, 8L)),
+    min_n(range = c(2L, 30L)),
+    sample_prop(range = c(0.6, 1.0)),
+    size = grid_size
+  )
+}
+
+# ---------------------------
+# 7) Baseline: zero-mean return forecast
+# ---------------------------
+eval_zero_mean = function(resamples) {
+  # prediction is always 0; compute metrics per fold then aggregate
+  fold_metrics = map_dfr(resamples$splits, function(spl) {
+    assess = rsample::assessment(spl)
+    y = assess$target
+    tibble::tibble(
+      rmse = yardstick::rmse_vec(y, rep(0, length(y))),
+      mae  = yardstick::mae_vec(y,  rep(0, length(y)))
+    )
+  })
+  
+  tibble::tibble(
+    model = "baseline_zero_mean",
+    rmse = mean(fold_metrics$rmse, na.rm = TRUE),
+    mae  = mean(fold_metrics$mae,  na.rm = TRUE)
+  )
+}
+
+# ---------------------------
+# 8) Tune + backtest XGBoost per horizon
+# ---------------------------
+tune_and_backtest = function(df_h, h) {
+  message("— Horizon h = ", h, " —")
+  
+  folds = make_rolling_folds(df_h, initial = initial_n, assess = h, skip = skip_n)
+  if (nrow(folds) < 3) stop("Not enough folds. Reduce initial_n or skip_n.")
+  
+  # Baseline
+  base = eval_zero_mean(folds) |>
+    mutate(h = h)
+  
+  # Workflow
+  rec = build_recipe(rsample::analysis(folds$splits[[1]]))
+  wf = workflow() |>
+    add_recipe(rec) |>
+    add_model(xgb_spec())
+  
+  # Tuning
+  grid = make_grid(rsample::analysis(folds$splits[[1]]))
+  ctrl = control_grid(save_pred = TRUE, verbose = TRUE, allow_par = TRUE)
+  
+  metrics = metric_set(rmse, mae)
+  
+  tuned = tune_grid(
+    wf,
+    resamples = folds,
+    grid = grid,
+    metrics = metrics,
+    control = ctrl
+  )
+  
+  best = select_best(tuned, metric = "rmse")
+  best_row = show_best(tuned, metric = "rmse", n = 1)
+  
+  xgb_metrics = tibble::tibble(
+    model = "xgb_direct_return",
+    h = h,
+    rmse = best_row$mean[[1]],
+    mae  = show_best(tuned, metric = "mae", n = 1)$mean[[1]]
+  )
+  
+  # Fit final on ALL data for this horizon
+  wf_final = finalize_workflow(wf, best)
+  fitted_final = fit(wf_final, data = df_h)
+  
+  list(
+    h = h,
+    folds = folds,
+    tuned = tuned,
+    best_params = best,
+    metrics = bind_rows(base, xgb_metrics),
+    fitted = fitted_final
+  )
+}
+
+# ---------------------------
+# 9) Run training for each horizon
+# ---------------------------
+results = map(horizons, function(h) {
+  df_h = make_supervised(feat, h)
+  tune_and_backtest(df_h, h)
+})
+
+# Aggregate metrics
+metrics_tbl = bind_rows(lapply(results, \(x) x$metrics)) |>
+  arrange(h, rmse)
+
+write_csv(metrics_tbl, file.path(out_dir, "backtest_metrics.csv"))
+
+# Pick “champion” per horizon (lowest RMSE)
+champions = metrics_tbl |>
+  group_by(h) |>
+  slice_min(order_by = rmse, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+# Collect fitted objects per horizon for saving
+fitted_by_h = setNames(
+  lapply(results, \(x) x$fitted),
+  paste0("h", horizons)
+)
+
+best_params_by_h = setNames(
+  lapply(results, \(x) x$best_params),
+  paste0("h", horizons)
+)
+
+# ---------------------------
+# 10) Save model bundle
+# ---------------------------
+model_bundle = list(
+  created_utc = format(Sys.time(), tz = "UTC"),
+  data_source = list(
+    db_name = db_name,
+    table = db_table,
+    n_rows = nrow(prices),
+    min_date = min(prices$date),
+    max_date = max(prices$date)
+  ),
+  target = "h-day-ahead log return (direct)",
+  horizons = horizons,
+  feature_set = c(
+    "lagged returns", "rolling mean/sd", "momentum sums",
+    "day-of-week", "month"
+  ),
+  cv = list(
+    method = "rolling_origin",
+    initial_n = initial_n,
+    skip_n = skip_n
+  ),
+  metrics = metrics_tbl,
+  champions = champions,
+  best_params_by_h = best_params_by_h,
+  fitted_by_h = fitted_by_h
+)
+
+saveRDS(model_bundle, file = "model.rds")
+
+message("✅ Done.")
+message("• Metrics: ", normalizePath(file.path(out_dir, "backtest_metrics.csv")))
+message("• Model bundle: ", normalizePath("model.rds"))
+print(champions)
+
+# ---------------------------
+# 11) Plots + technical report
+# ---------------------------
+
+# ---- Plot 1: Backtest RMSE by horizon (baseline vs model)
+p_rmse = metrics_tbl |>
+  ggplot(aes(x = factor(h), y = rmse, fill = model)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Rolling-origin backtest RMSE (by horizon)",
+    x = "Horizon (trading days ahead)",
+    y = "RMSE (log-return)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(out_dir, "backtest_rmse_by_horizon.png"),
+       p_rmse, width = 9, height = 5, dpi = 300)
+
+# ---- Plot 2: Actual vs Predicted (champion params), pooled across folds
+# Collect predictions for BEST params per horizon
+preds_best = purrr::map_dfr(results, function(res) {
+  p = tune::collect_predictions(res$tuned)
+  
+  # "best_params" is a 1-row tibble with tuned columns; use it to filter preds
+  best = res$best_params
+  
+  # Ensure we only keep the predictions generated under the best hyperparams
+  join_cols = intersect(names(best), names(p))
+  if (length(join_cols) == 0) stop("No common tuning parameter columns found to filter best predictions.")
+  
+  p_best = p |>
+    dplyr::inner_join(best, by = join_cols) |>
+    dplyr::mutate(h = res$h)
+  
+  p_best
+})
+
+p_avp = preds_best |>
+  ggplot(aes(x = target, y = .pred)) +
+  geom_point(alpha = 0.20) +
+  geom_abline(slope = 1, intercept = 0) +
+  facet_wrap(~ h, scales = "free") +
+  labs(
+    title = "Backtest calibration: actual vs predicted (log-return)",
+    x = "Actual",
+    y = "Predicted"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(out_dir, "actual_vs_pred.png"),
+       p_avp, width = 10, height = 5, dpi = 300)
+

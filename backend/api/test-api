@@ -1,0 +1,35 @@
+R -q -e "pr = plumber::plumb('main.R'); pr$run(host='0.0.0.0', port=8000)"
+
+R -q -e "plumber::plumb('main.R')$run(host='0.0.0.0', port=8000)"
+
+curl -i [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
+
+curl -i [http://127.0.0.1:8000/meta](http://127.0.0.1:8000/meta)
+
+export DB_USER="amzn_user"
+export DB_PASSWORD="your_password"
+export DB_HOST="localhost"
+export DB_PORT="5432"
+export DB_NAME="amzn_ts"
+export AMZN_SCHEMA="finance"
+export AMZN_TABLE="amzn_daily"
+
+curl -i -X POST [http://127.0.0.1:8000/predict](http://127.0.0.1:8000/predict) \
+-H "Content-Type: application/json" \
+-d '{}'
+
+curl -i -X POST [http://127.0.0.1:8000/predict](http://127.0.0.1:8000/predict) \
+-H "Content-Type: application/json" \
+-d '{"horizon": 5, "as_of": "2025-12-12"}'
+
+curl -i -X POST [http://127.0.0.1:8000/predict](http://127.0.0.1:8000/predict) \
+-H "Content-Type: application/json" \
+-d '{bad json}'
+
+curl -i -X POST [http://127.0.0.1:8000/predict](http://127.0.0.1:8000/predict) \
+-H "Content-Type: application/json" \
+-d '{"horizon": 2}'
+
+curl -i -X POST [http://127.0.0.1:8000/predict](http://127.0.0.1:8000/predict) \
+-H "Content-Type: application/json" \
+-d '{"as_of":"not-a-date"}'

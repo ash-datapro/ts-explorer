@@ -1,0 +1,14 @@
+export DB_USER="amzn_user"
+export DB_PASSWORD="timeseries1"
+export DB_NAME="amzn_ts"
+export DB_HOST="localhost"
+export DB_PORT="5432"
+
+Rscript train-model.R
+
+GRANT CONNECT, TEMP ON DATABASE amzn_ts TO amzn_user;
+GRANT CREATE ON DATABASE amzn_ts TO amzn_user;
+
+CREATE SCHEMA IF NOT EXISTS finance AUTHORIZATION amzn_user;
+-- if it already exists but is owned by someone else:
+ALTER SCHEMA finance OWNER TO amzn_user;

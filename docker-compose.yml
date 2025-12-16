@@ -1,0 +1,68 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: ts_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ts_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ts_password}
+      POSTGRES_DB: ${POSTGRES_DB:-ts_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # If you have init SQL/scripts in ./postgresql, they'll run on first boot
+      - ./postgresql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    container_name: ts_api
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/usr/src/app
+    environment:
+      DB_USER: ${POSTGRES_USER:-ts_user}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-ts_password}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB:-ts_db}
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ts_dashboard
+    ports:
+      - "8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    volumes:
+      - ./frontend:/app
+      # So your Shiny Diagnostics tab can find "backend/reports" inside the frontend container
+      - ./backend/reports:/app/backend/reports:ro
+    environment:
+      DB_USER: ${POSTGRES_USER:-ts_user}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-ts_password}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB:-ts_db}
+      PREDICT_API_URL: http://backend:8000/predict
+    restart: unless-stopped
+
+volumes:
+  pgdata:

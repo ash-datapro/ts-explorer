@@ -1,0 +1,122 @@
+psql -U postgres
+
+CREATE ROLE amzn_user WITH LOGIN PASSWORD 'change_me_strong_password';
+
+CREATE DATABASE amzn_ts OWNER amzn_user;
+
+\c amzn_ts
+
+CREATE SCHEMA IF NOT EXISTS finance AUTHORIZATION amzn_user;
+
+CREATE TABLE IF NOT EXISTS finance.amzn_daily (
+  date  DATE PRIMARY KEY,
+  amzn  NUMERIC(18,6)
+);
+
+-- CREATE INDEX IF NOT EXISTS idx_amzn_daily_date ON finance.amzn_daily(date);
+
+\q
+
+psql -U amzn_user -d amzn_ts
+
+\copy finance.amzn_daily(date, amzn)
+FROM '/absolute/path/to/amazon_stock.csv'
+WITH (FORMAT csv, HEADER true);
+
+COPY finance.amzn_daily(date, amzn)
+FROM '/path/on_server/amazon_stock.csv'
+WITH (FORMAT csv, HEADER true);
+
+SELECT COUNT(*) AS n_rows,
+       MIN(date) AS min_date,
+       MAX(date) AS max_date
+FROM finance.amzn_daily;
+
+SELECT *
+FROM finance.amzn_daily
+ORDER BY date
+LIMIT 5;
+
+install.packages(c("DBI", "RPostgres", "dplyr"))
+
+library(DBI)
+library(RPostgres)
+library(dplyr)
+
+con = dbConnect(
+  RPostgres::Postgres(),
+  dbname = "amzn_ts",
+  host = "localhost",
+  port = 5432,
+  user = "amzn_user",
+  password = "change_me_strong_password"
+)
+
+# Quick check
+dbGetQuery(con, "
+  SELECT COUNT(*) AS n_rows,
+         MIN(date) AS min_date,
+         MAX(date) AS max_date
+  FROM finance.amzn_daily;
+")
+
+# Pull last 10 rows
+last10 = dbGetQuery(con, "
+  SELECT date, amzn
+  FROM finance.amzn_daily
+  ORDER BY date DESC
+  LIMIT 10;
+")
+print(last10)
+
+dbDisconnect(con)
+
+
+
+library(DBI)
+library(RPostgres)
+library(data.table)
+
+csv_path = "/absolute/path/to/amazon_stock.csv"  # adjust
+
+x = fread(csv_path)
+stopifnot(all(c("date", "AMZN") %in% names(x)))
+
+x[, date = as.IDate(date)]
+x[, AMZN = as.numeric(AMZN)]
+setnames(x, "AMZN", "amzn")
+
+con = dbConnect(
+  RPostgres::Postgres(),
+  dbname = "amzn_ts",
+  host = "localhost",
+  port = 5432,
+  user = "amzn_user",
+  password = "change_me_strong_password"
+)
+
+# Create table if not exists (idempotent)
+dbExecute(con, "
+  CREATE SCHEMA IF NOT EXISTS finance;
+  CREATE TABLE IF NOT EXISTS finance.amzn_daily (
+    date DATE PRIMARY KEY,
+    amzn NUMERIC(18,6)
+  );
+")
+
+# Upsert (handles re-runs safely)
+# Approach: write to temp table -> INSERT ... ON CONFLICT
+dbWriteTable(con, Id(schema = "finance", table = "amzn_stage"), x,
+             overwrite = TRUE)
+
+dbExecute(con, "
+  INSERT INTO finance.amzn_daily(date, amzn)
+  SELECT date, amzn
+  FROM finance.amzn_stage
+  ON CONFLICT (date) DO UPDATE
+  SET amzn = EXCLUDED.amzn;
+")
+
+dbExecute(con, "DROP TABLE finance.amzn_stage;")
+
+dbDisconnect(con)
